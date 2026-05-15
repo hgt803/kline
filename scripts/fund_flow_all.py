@@ -29,19 +29,44 @@ def main():
                         default=None)
     args = parser.parse_args()
 
+    def _parse_dates(series) -> _pd.Series:
+        s = series.astype(str).str.strip().str.replace("/", "-", regex=False)
+        try:
+            return _pd.to_datetime(s, format="mixed", errors="coerce")
+        except (TypeError, ValueError):
+            return _pd.to_datetime(s, errors="coerce")
+
     def save_summary_file(path: str, date_str: str, net_in_yi: float, turnover_in_yi: float) -> _pd.DataFrame:
         import os
 
         if path is None:
             path = "fund_flow_summary.csv"
+
+        date_parsed = _parse_dates(_pd.Series([date_str])).iloc[0]
+        date_iso = date_parsed.strftime("%Y-%m-%d") if not _pd.isna(date_parsed) else date_str
+        new_row = {
+            "日期": date_iso,
+            "净流入（亿）": round(net_in_yi, 2),
+            "成交额（亿）": round(turnover_in_yi, 2),
+        }
+
         if os.path.exists(path):
-            prev = _pd.read_csv(path, encoding="utf-8-sig")
-            prev = prev[prev["日期"] != date_str]
-            combined = _pd.concat([_pd.DataFrame([{"日期": date_str, "净流入（亿）": round(net_in_yi, 2), "成交额（亿）": round(turnover_in_yi, 2)}]), prev], ignore_index=True)
+            prev = _pd.read_csv(path, encoding="utf-8-sig", dtype={"日期": str})
+            prev["_dt"] = _parse_dates(prev["日期"])
+            if not _pd.isna(date_parsed):
+                prev = prev[prev["_dt"].dt.normalize() != date_parsed.normalize()]
+            else:
+                prev = prev[prev["日期"] != date_str]
+            prev = prev.drop(columns=["_dt"], errors="ignore")
+            combined = _pd.concat([_pd.DataFrame([new_row]), prev], ignore_index=True)
         else:
-            combined = _pd.DataFrame([{"日期": date_str, "净流入（亿）": round(net_in_yi, 2), "成交额（亿）": round(turnover_in_yi, 2)}])
-        combined["_dt"] = _pd.to_datetime(combined["日期"], errors="coerce")
-        combined = combined.sort_values(by="_dt", ascending=False).drop(columns=["_dt"])
+            combined = _pd.DataFrame([new_row])
+
+        combined["_dt"] = _parse_dates(combined["日期"])
+        combined["日期"] = combined["_dt"].dt.strftime("%Y-%m-%d")
+        combined = combined.sort_values(by="_dt", ascending=False)
+        combined = combined.drop_duplicates(subset=["_dt"], keep="first")
+        combined = combined.drop(columns=["_dt"])
         combined.to_csv(path, index=False, encoding="utf-8-sig")
         return combined
 
