@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-根据 fund_flow_summary.csv 中的每日净流入绘制 K 线图（A 股配色：涨红跌绿）。
+根据 fund_flow_summary.csv 绘制大盘累计资金 K 线图（A 股配色：涨红跌绿）。
+
+每日 K 线：开盘 = 昨日累计收盘，收盘 = 昨日收盘 + 当日净流入（在昨日结果上增减）。
+首日开盘为 0，收盘为当日净流入。
 
 用法:
   python scripts/fund_flow_kline.py
@@ -41,11 +44,14 @@ def load_summary(path: Path) -> pd.DataFrame:
 
 
 def build_ohlc(df: pd.DataFrame) -> pd.DataFrame:
-    close = df["净流入（亿）"].astype(float)
+    """按日净流入累加：收盘为累计大盘资金，开盘为前日收盘。"""
+    daily = df["净流入（亿）"].astype(float)
+    close = daily.cumsum()
     open_ = close.shift(1).fillna(0.0)
     return pd.DataFrame(
         {
             "date": df["_dt"].dt.strftime("%Y-%m-%d"),
+            "change": daily,
             "open": open_,
             "high": pd.concat([open_, close], axis=1).max(axis=1),
             "low": pd.concat([open_, close], axis=1).min(axis=1),
@@ -135,7 +141,7 @@ def render_svg(ohlc: pd.DataFrame, title: str) -> str:
 
     parts.append(
         f'<text x="{margin_l}" y="{height-8}" font-size="11" font-family="sans-serif" fill="#888">'
-        f'单位：亿 · 涨红跌绿</text>'
+        f'纵轴：累计净流入（亿）· 当日涨跌：涨红跌绿</text>'
     )
     parts.append("</svg>")
     return "\n".join(parts)
@@ -167,7 +173,7 @@ def save_chart(ohlc: pd.DataFrame, out_path: Path, title: str) -> None:
             ax.add_patch(Rectangle((xi - width / 2, bb), width, bh or 0.01, facecolor=color, edgecolor=color))
         ax.axhline(0, color="#888", ls="--", lw=0.8, alpha=0.7)
         ax.set_title(title)
-        ax.set_ylabel("净流入（亿）")
+        ax.set_ylabel("累计净流入（亿）")
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
         fig.autofmt_xdate(rotation=30)
         ax.grid(True, ls=":", alpha=0.4)
@@ -182,7 +188,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="全市场净流入 K 线图（涨红跌绿）")
     parser.add_argument("--input", default="fund_flow_summary.csv", help="摘要 CSV")
     parser.add_argument("--output", default="fund_flow_kline.svg", help="输出图片/SVG")
-    parser.add_argument("--title", default="全市场资金净流入 K 线（亿）")
+    parser.add_argument("--title", default="大盘累计资金 K 线（亿）")
     args = parser.parse_args()
 
     in_path, out_path = Path(args.input), Path(args.output)
