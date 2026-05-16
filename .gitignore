@@ -1,2 +1,5 @@
 fund_flow_summary.csv
 fund_flow_kline.svg
+fund_flow_kline.png
+.DS_Store
+.mplcache/fontlist-v390.json

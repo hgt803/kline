@@ -19,6 +19,21 @@ RED, GREEN = "#e74c3c", "#2ecc71"
 # =========================
 # Telegram 推送（图片）
 # =========================
+_TELEGRAM_PHOTO_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def resolve_telegram_photo_path(path: Path) -> Path | None:
+    """Telegram sendPhoto 仅支持位图，不支持 SVG。"""
+    suffix = path.suffix.lower()
+    if suffix in _TELEGRAM_PHOTO_SUFFIXES:
+        return path if path.is_file() and path.stat().st_size > 0 else None
+    if suffix == ".svg":
+        png = path.with_suffix(".png")
+        if png.is_file() and png.stat().st_size > 0:
+            return png
+    return None
+
+
 def telegram_push_image(image_path: str, caption: str = ""):
     bot_token = os.getenv("TG_BOT_TOKEN")
     chat_id = os.getenv("TG_USER_ID")
@@ -27,11 +42,25 @@ def telegram_push_image(image_path: str, caption: str = ""):
         print("未配置 TG_BOT_TOKEN / TG_USER_ID，跳过 Telegram 推送")
         return
 
+    path = Path(image_path)
+    photo_path = resolve_telegram_photo_path(path)
+    if photo_path is None:
+        if path.suffix.lower() == ".svg":
+            print(
+                "Telegram 不支持 SVG 图片推送，请安装 matplotlib 生成 PNG，"
+                "或使用 --output fund_flow_kline.png"
+            )
+        else:
+            print(f"Telegram 推送跳过：无效或缺失的图片 {path}")
+        return
+
+    mime = "image/jpeg" if photo_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-        with open(image_path, "rb") as f:
-            files = {"photo": f}
-            data = {"chat_id": chat_id, "caption": caption}
+        with open(photo_path, "rb") as f:
+            files = {"photo": (photo_path.name, f, mime)}
+            data = {"chat_id": chat_id, "caption": caption[:1024]}
             r = requests.post(url, data=data, files=files, timeout=20)
 
         if r.status_code == 200:
@@ -183,7 +212,7 @@ def save_chart(ohlc: pd.DataFrame, out_path: Path, title: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="fund_flow_summary.csv")
-    parser.add_argument("--output", default="fund_flow_kline.svg")
+    parser.add_argument("--output", default="fund_flow_kline.png")
     parser.add_argument("--title", default="大盘累计资金 K 线（亿）")
     args = parser.parse_args()
 
@@ -195,10 +224,18 @@ def main():
         ohlc = build_ohlc(df)
         save_chart(ohlc, out_path, args.title)
 
+        # Telegram 仅支持位图；若主输出为 SVG，额外生成 PNG 用于推送
+        push_path = out_path
+        if out_path.suffix.lower() == ".svg":
+            png_path = out_path.with_suffix(".png")
+            save_chart(ohlc, png_path, args.title)
+            if png_path.exists():
+                push_path = png_path
+
         msg = f"📊 {args.title}\n已生成：{out_path.name}\n数据：{len(ohlc)} 天"
 
         # 1️⃣ Telegram 图片推送（主推）
-        telegram_push_image(str(out_path), caption=msg)
+        telegram_push_image(str(push_path), caption=msg)
 
         # 2️⃣ 青龙 PUSH_KEY 文本推送（备份）
         qinglong_push("资金K线生成完成", msg)
