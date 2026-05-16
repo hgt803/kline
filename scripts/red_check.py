@@ -1,7 +1,5 @@
 import os
-import time
 import warnings
-from typing import Optional
 
 warnings.filterwarnings("ignore", module="urllib3")
 
@@ -47,7 +45,7 @@ def compute_rsi(series, period=14):
     return rsi
 
 # ------------------ 数据获取 ------------------
-def _normalize_weekly(df: pd.DataFrame, date_col: str, open_col: str, close_col: str) -> pd.DataFrame:
+def _normalize_ohlc(df: pd.DataFrame, date_col: str, open_col: str, close_col: str) -> pd.DataFrame:
     out = df.rename(columns={date_col: "trade_date", open_col: "open", close_col: "close"})
     out["trade_date"] = pd.to_datetime(out["trade_date"])
     out = out.sort_values("trade_date").reset_index(drop=True)
@@ -56,73 +54,90 @@ def _normalize_weekly(df: pd.DataFrame, date_col: str, open_col: str, close_col:
     return out[["trade_date", "open", "close"]]
 
 
-def _fetch_em_weekly(symbol: str, retries: int = 3) -> pd.DataFrame:
-    last_err: Optional[Exception] = None
-    for attempt in range(retries):
-        try:
-            df = ak.fund_etf_hist_em(symbol=symbol, period="weekly", adjust="")
-            if df is not None and not df.empty:
-                return _normalize_weekly(df, "日期", "开盘", "收盘")
-        except Exception as e:
-            last_err = e
-            if attempt < retries - 1:
-                time.sleep(2 * (attempt + 1))
-    raise last_err or ValueError("东方财富周线获取失败")
+def _sina_symbol(symbol: str) -> str:
+    return f"sh{symbol}" if symbol.startswith("5") else f"sz{symbol}"
+
+
+def _fetch_sina_daily(symbol: str) -> pd.DataFrame:
+    df = ak.fund_etf_hist_sina(symbol=_sina_symbol(symbol))
+    if df is None or df.empty:
+        raise ValueError("新浪日线获取失败")
+    return _normalize_ohlc(df, "date", "open", "close")
 
 
 def _fetch_sina_weekly(symbol: str) -> pd.DataFrame:
-    # 上交所 ETF：510880 -> sh510880
-    sina_symbol = f"sh{symbol}" if symbol.startswith("5") else f"sz{symbol}"
-    df = ak.fund_etf_hist_sina(symbol=sina_symbol)
-    if df is None or df.empty:
-        raise ValueError("新浪日线获取失败")
-    daily = df.copy()
-    daily["date"] = pd.to_datetime(daily["date"])
-    daily = daily.set_index("date").sort_index()
+    daily = _fetch_sina_daily(symbol)
+    daily = daily.set_index("trade_date").sort_index()
     weekly = daily.resample("W-FRI").agg(
         {"open": "first", "close": "last"}
     ).dropna(subset=["close"])
-    return _normalize_weekly(weekly.reset_index(), "date", "open", "close")
+    return weekly.reset_index()
+
+
+def fetch_daily_data(symbol: str) -> pd.DataFrame:
+    return _fetch_sina_daily(symbol)
 
 
 def fetch_weekly_data(symbol: str) -> pd.DataFrame:
-    try:
-        return _fetch_em_weekly(symbol)
-    except Exception as e_em:
-        print(f"东方财富接口失败，改用新浪：{e_em}")
-        return _fetch_sina_weekly(symbol)
+    return _fetch_sina_weekly(symbol)
+
+
+def latest_indicator_row(df: pd.DataFrame):
+    work = df.copy()
+    work["rsi"] = compute_rsi(work["close"], rsi_period)
+    work["ma60"] = work["close"].rolling(ma60_period).mean()
+    work["ma120"] = work["close"].rolling(ma120_period).mean()
+    return work.iloc[-1]
 
 # ------------------ 策略逻辑 ------------------
-def format_push(body: str) -> str:
-    return f"{etf_label}\n{body}"
+def _fmt_metric(value, digits: int = 2) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    return f"{float(value):.{digits}f}"
 
 
-def analyze_signal(df):
-    df['rsi'] = compute_rsi(df['close'], rsi_period)
-    df['ma60'] = df['close'].rolling(ma60_period).mean()
-    df['ma120'] = df['close'].rolling(ma120_period).mean()
+def format_key_metrics(row) -> str:
+    return (
+        "📊 关键指标\n"
+        f"当场股价：{_fmt_metric(row['close'])}\n"
+        f"60 日均线：{_fmt_metric(row['ma60'])}\n"
+        f"120 日均线：{_fmt_metric(row['ma120'])}\n"
+        f"RSI：{_fmt_metric(row['rsi'])}"
+    )
 
-    latest = df.iloc[-1]
+
+def format_push(body: str, latest) -> str:
+    return f"{etf_label}\n{body}\n\n{format_key_metrics(latest)}"
+
+
+def analyze_signal(df_weekly, metrics_row):
+    w = df_weekly.copy()
+    w["rsi"] = compute_rsi(w["close"], rsi_period)
+    w["ma60"] = w["close"].rolling(ma60_period).mean()
+    w["ma120"] = w["close"].rolling(ma120_period).mean()
+    latest = w.iloc[-1]
 
     # 全仓买入条件
-    if latest['close'] < latest['ma120']:
-        body = f"全仓买入信号：当前价格 {latest['close']:.2f} 跌破 120 周均线 ({latest['ma120']:.2f})"
+    if latest["close"] < latest["ma120"]:
+        body = "全仓买入信号：跌破 120 周均线"
     # 8 成仓买入条件
-    elif latest['rsi'] < 48 and latest['close'] < latest['ma60']:
-        body = f"买入 8 成仓位信号：当前价格 {latest['close']:.2f}, RSI {latest['rsi']:.2f}, 低于 60 周均线 ({latest['ma60']:.2f})"
+    elif latest["rsi"] < 48 and latest["close"] < latest["ma60"]:
+        body = "买入 8 成仓位信号：RSI 偏低且低于 60 周均线"
     # 清仓条件：RSI > 60 且本周K线为绿色
-    elif latest['rsi'] > 60 and latest['close'] < latest['open']:
-        body = f"清仓信号：当前价格 {latest['close']:.2f}, RSI {latest['rsi']:.2f}, 出现下跌K线"
+    elif latest["rsi"] > 60 and latest["close"] < latest["open"]:
+        body = "清仓信号：RSI 偏高且出现下跌 K 线"
     else:
         body = "这周不宜操作"
 
-    send_telegram(format_push(body))
+    send_telegram(format_push(body, metrics_row))
 
 # ------------------ 主程序 ------------------
 def main():
     try:
-        df = fetch_weekly_data(symbol)
-        analyze_signal(df)
+        df_weekly = fetch_weekly_data(symbol)
+        df_daily = fetch_daily_data(symbol)
+        metrics_row = latest_indicator_row(df_daily)
+        analyze_signal(df_weekly, metrics_row)
     except Exception as e:
         print(f"脚本异常: {e}")
 

@@ -173,6 +173,48 @@ def render_svg(ohlc: pd.DataFrame, title: str) -> str:
     return "\n".join(svg)
 
 
+def _configure_matplotlib_chinese() -> None:
+    """选用系统可用中文字体，避免标题/标签显示为方框。"""
+    import matplotlib.pyplot as plt
+    from matplotlib import font_manager
+
+    candidates = [
+        "PingFang SC",
+        "Heiti SC",
+        "STHeiti",
+        "Songti SC",
+        "Microsoft YaHei",
+        "SimHei",
+        "WenQuanYi Micro Hei",
+        "Noto Sans CJK SC",
+        "Source Han Sans SC",
+        "Arial Unicode MS",
+    ]
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            plt.rcParams["font.sans-serif"] = [name, *plt.rcParams["font.sans-serif"]]
+            break
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+def _png_date_ticks(ax, dates: pd.Series, n: int) -> None:
+    """横轴显示交易日（YYYY-MM-DD），避免默认 0,1,2… 序号。"""
+    if n == 0:
+        return
+    step = max(1, n // 10)
+    tick_idx = list(range(0, n, step))
+    if tick_idx[-1] != n - 1:
+        tick_idx.append(n - 1)
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels(
+        [pd.Timestamp(dates.iloc[i]).strftime("%Y-%m-%d") for i in tick_idx],
+        rotation=45,
+        ha="right",
+    )
+    ax.set_xlabel("日期")
+
+
 def save_chart(ohlc: pd.DataFrame, out_path: Path, title: str):
     svg = render_svg(ohlc, title)
 
@@ -182,9 +224,17 @@ def save_chart(ohlc: pd.DataFrame, out_path: Path, title: str):
 
     # PNG fallback
     try:
+        mpl_dir = Path(__file__).resolve().parent.parent / ".mplcache"
+        mpl_dir.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("MPLCONFIGDIR", str(mpl_dir))
+
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
 
+        _configure_matplotlib_chinese()
+
+        dates = pd.to_datetime(ohlc["date"])
+        n = len(ohlc)
         fig, ax = plt.subplots(figsize=(12, 6))
 
         for i, row in enumerate(ohlc.itertuples()):
@@ -195,9 +245,13 @@ def save_chart(ohlc: pd.DataFrame, out_path: Path, title: str):
                                    abs(row.close-row.open) or 0.01,
                                    color=color))
 
+        _png_date_ticks(ax, dates, n)
         ax.set_title(title)
+        ax.set_ylabel("累计净流入（亿）")
         ax.grid(True, alpha=0.3)
-        plt.savefig(out_path, bbox_inches="tight")
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        plt.savefig(out_path, bbox_inches="tight", dpi=120)
         plt.close()
 
     except Exception:
