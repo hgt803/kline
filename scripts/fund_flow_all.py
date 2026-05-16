@@ -115,6 +115,20 @@ def main():
         combined.to_csv(path, index=False, encoding="utf-8-sig")
         return combined
 
+    def load_latest_summary_row(path: str) -> _pd.DataFrame | None:
+        if path is None:
+            path = "fund_flow_summary.csv"
+        if not os.path.exists(path):
+            return None
+        df = _pd.read_csv(path, encoding="utf-8-sig", dtype={"日期": str})
+        if df.empty:
+            return None
+        df["_dt"] = _parse_dates(df["日期"])
+        df = df.dropna(subset=["_dt"]).sort_values("_dt", ascending=False)
+        if df.empty:
+            return None
+        return df.drop(columns=["_dt"]).iloc[[0]]
+
     try:
         import akshare as ak
     except Exception as e:
@@ -180,24 +194,26 @@ def main():
 
         record_date = date_parsed.date()
         date_iso = record_date.isoformat()
-        latest_row = _pd.DataFrame([{
-            "日期": date_iso,
-            "净流入（亿）": round(net_in_yi, 2),
-            "成交额（亿）": round(turnover_in_yi, 2),
-        }])
+        out_path = args.summary_out if args.summary_out else "fund_flow_summary.csv"
 
         if is_a_share_trading_day(record_date):
-            out_path = args.summary_out if args.summary_out else "fund_flow_summary.csv"
             combined = save_summary_file(out_path, date_str, net_in_yi, turnover_in_yi)
             print("已保存摘要 CSV（单位：亿）：", out_path)
             print(combined.to_string(index=False))
-            latest_row = combined.iloc[[0]]
         else:
             print(f"{date_iso} 非 A 股交易日，跳过 CSV 写入。")
-            print(latest_row.to_string(index=False))
+
+        latest_row = load_latest_summary_row(out_path)
+        if latest_row is None:
+            print("CSV 无可用记录，跳过 Telegram 推送。")
+            return
+
+        push_date = latest_row.iloc[0]["日期"]
+        print("Telegram 将推送 CSV 最新一条：")
+        print(latest_row.to_string(index=False))
 
         md_table = format_markdown_table(latest_row)
-        content = f"💹 全市场资金流摘要（{date_str}）\n{md_table}"
+        content = f"💹 全市场资金流摘要（{push_date}）\n{md_table}"
         telegram_push(content)
     else:
         print("未能获取资金流数据，跳过推送。")
