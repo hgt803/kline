@@ -74,7 +74,7 @@ def analyze_signal(df):
     elif latest['rsi'] > 60 and latest['close'] < latest['open']:
         body = f"清仓信号：当前价格 {latest['close']:.2f}, RSI {latest['rsi']:.2f}, 出现下跌K线"
     else:
-        body = "今天不宜操作"
+        body = "这周不宜操作"
 
     send_telegram(format_push(body))
 
