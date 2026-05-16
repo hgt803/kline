@@ -1,7 +1,13 @@
 import os
+import time
+import warnings
+from typing import Optional
+
+warnings.filterwarnings("ignore", module="urllib3")
+
+import akshare as ak
 import pandas as pd
 import requests
-import akshare as ak
 
 # ------------------ 全局变量 ------------------
 bot_token = os.getenv("TG_BOT_TOKEN")
@@ -41,16 +47,50 @@ def compute_rsi(series, period=14):
     return rsi
 
 # ------------------ 数据获取 ------------------
-def fetch_weekly_data(symbol: str) -> pd.DataFrame:
-    df = ak.fund_etf_hist_em(symbol=symbol, period="weekly", adjust="")
+def _normalize_weekly(df: pd.DataFrame, date_col: str, open_col: str, close_col: str) -> pd.DataFrame:
+    out = df.rename(columns={date_col: "trade_date", open_col: "open", close_col: "close"})
+    out["trade_date"] = pd.to_datetime(out["trade_date"])
+    out = out.sort_values("trade_date").reset_index(drop=True)
+    out["open"] = out["open"].astype(float)
+    out["close"] = out["close"].astype(float)
+    return out[["trade_date", "open", "close"]]
+
+
+def _fetch_em_weekly(symbol: str, retries: int = 3) -> pd.DataFrame:
+    last_err: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            df = ak.fund_etf_hist_em(symbol=symbol, period="weekly", adjust="")
+            if df is not None and not df.empty:
+                return _normalize_weekly(df, "日期", "开盘", "收盘")
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))
+    raise last_err or ValueError("东方财富周线获取失败")
+
+
+def _fetch_sina_weekly(symbol: str) -> pd.DataFrame:
+    # 上交所 ETF：510880 -> sh510880
+    sina_symbol = f"sh{symbol}" if symbol.startswith("5") else f"sz{symbol}"
+    df = ak.fund_etf_hist_sina(symbol=sina_symbol)
     if df is None or df.empty:
-        raise ValueError("获取数据失败")
-    df = df.rename(columns={"日期": "trade_date", "开盘": "open", "收盘": "close"})
-    df["trade_date"] = pd.to_datetime(df["trade_date"])
-    df = df.sort_values("trade_date").reset_index(drop=True)
-    df["open"] = df["open"].astype(float)
-    df["close"] = df["close"].astype(float)
-    return df
+        raise ValueError("新浪日线获取失败")
+    daily = df.copy()
+    daily["date"] = pd.to_datetime(daily["date"])
+    daily = daily.set_index("date").sort_index()
+    weekly = daily.resample("W-FRI").agg(
+        {"open": "first", "close": "last"}
+    ).dropna(subset=["close"])
+    return _normalize_weekly(weekly.reset_index(), "date", "open", "close")
+
+
+def fetch_weekly_data(symbol: str) -> pd.DataFrame:
+    try:
+        return _fetch_em_weekly(symbol)
+    except Exception as e_em:
+        print(f"东方财富接口失败，改用新浪：{e_em}")
+        return _fetch_sina_weekly(symbol)
 
 # ------------------ 策略逻辑 ------------------
 def format_push(body: str) -> str:
