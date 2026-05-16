@@ -12,9 +12,9 @@ bot_token = os.getenv("TG_BOT_TOKEN")
 chat_id = os.getenv("TG_USER_ID")
 symbol = "510880"  # 510880 红利 ETF（AkShare 代码）
 etf_label = "红利 ETF"
-rsi_period = 14
-ma60_period = 60
-ma120_period = 120
+rsi_period = 14  # 14 周
+ma60_period = 60  # 60 周
+ma120_period = 120  # 120 周
 
 # ------------------ Telegram 推送函数 ------------------
 def send_telegram(message):
@@ -58,36 +58,25 @@ def _sina_symbol(symbol: str) -> str:
     return f"sh{symbol}" if symbol.startswith("5") else f"sz{symbol}"
 
 
-def _fetch_sina_daily(symbol: str) -> pd.DataFrame:
+def fetch_sina_daily(symbol: str) -> pd.DataFrame:
     df = ak.fund_etf_hist_sina(symbol=_sina_symbol(symbol))
     if df is None or df.empty:
         raise ValueError("新浪日线获取失败")
     return _normalize_ohlc(df, "date", "open", "close")
 
 
-def _fetch_sina_weekly(symbol: str) -> pd.DataFrame:
-    daily = _fetch_sina_daily(symbol)
-    daily = daily.set_index("trade_date").sort_index()
-    weekly = daily.resample("W-FRI").agg(
-        {"open": "first", "close": "last"}
-    ).dropna(subset=["close"])
+def daily_to_weekly(daily: pd.DataFrame) -> pd.DataFrame:
+    w = daily.set_index("trade_date").sort_index()
+    weekly = w.resample("W-FRI").agg({"open": "first", "close": "last"}).dropna(subset=["close"])
     return weekly.reset_index()
 
 
-def fetch_daily_data(symbol: str) -> pd.DataFrame:
-    return _fetch_sina_daily(symbol)
-
-
-def fetch_weekly_data(symbol: str) -> pd.DataFrame:
-    return _fetch_sina_weekly(symbol)
-
-
-def latest_indicator_row(df: pd.DataFrame):
-    work = df.copy()
-    work["rsi"] = compute_rsi(work["close"], rsi_period)
-    work["ma60"] = work["close"].rolling(ma60_period).mean()
-    work["ma120"] = work["close"].rolling(ma120_period).mean()
-    return work.iloc[-1]
+def prepare_weekly_indicators(df_weekly: pd.DataFrame) -> pd.DataFrame:
+    out = df_weekly.copy()
+    out["rsi"] = compute_rsi(out["close"], rsi_period)
+    out["ma60"] = out["close"].rolling(ma60_period).mean()
+    out["ma120"] = out["close"].rolling(ma120_period).mean()
+    return out
 
 # ------------------ 策略逻辑 ------------------
 def _fmt_metric(value, digits: int = 2) -> str:
@@ -96,25 +85,22 @@ def _fmt_metric(value, digits: int = 2) -> str:
     return f"{float(value):.{digits}f}"
 
 
-def format_key_metrics(row) -> str:
+def format_key_metrics(row, spot_close: float) -> str:
     return (
         "📊 关键指标\n"
-        f"当场股价：{_fmt_metric(row['close'])}\n"
-        f"60 日均线：{_fmt_metric(row['ma60'])}\n"
-        f"120 日均线：{_fmt_metric(row['ma120'])}\n"
-        f"RSI：{_fmt_metric(row['rsi'])}"
+        f"当场股价：{_fmt_metric(spot_close)}\n"
+        f"60 周均线：{_fmt_metric(row['ma60'])}\n"
+        f"120 周均线：{_fmt_metric(row['ma120'])}\n"
+        f"RSI(14周)：{_fmt_metric(row['rsi'])}"
     )
 
 
-def format_push(body: str, latest) -> str:
-    return f"{etf_label}\n{body}\n\n{format_key_metrics(latest)}"
+def format_push(body: str, row, spot_close: float) -> str:
+    return f"{etf_label}\n{body}\n\n{format_key_metrics(row, spot_close)}"
 
 
-def analyze_signal(df_weekly, metrics_row):
-    w = df_weekly.copy()
-    w["rsi"] = compute_rsi(w["close"], rsi_period)
-    w["ma60"] = w["close"].rolling(ma60_period).mean()
-    w["ma120"] = w["close"].rolling(ma120_period).mean()
+def analyze_signal(df_weekly: pd.DataFrame, spot_close: float):
+    w = prepare_weekly_indicators(df_weekly)
     latest = w.iloc[-1]
 
     # 全仓买入条件
@@ -129,15 +115,15 @@ def analyze_signal(df_weekly, metrics_row):
     else:
         body = "这周不宜操作"
 
-    send_telegram(format_push(body, metrics_row))
+    send_telegram(format_push(body, latest, spot_close))
 
 # ------------------ 主程序 ------------------
 def main():
     try:
-        df_weekly = fetch_weekly_data(symbol)
-        df_daily = fetch_daily_data(symbol)
-        metrics_row = latest_indicator_row(df_daily)
-        analyze_signal(df_weekly, metrics_row)
+        daily = fetch_sina_daily(symbol)
+        weekly = daily_to_weekly(daily)
+        spot_close = float(daily.iloc[-1]["close"])
+        analyze_signal(weekly, spot_close)
     except Exception as e:
         print(f"脚本异常: {e}")
 
