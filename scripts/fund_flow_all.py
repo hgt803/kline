@@ -12,8 +12,22 @@ import argparse
 import datetime
 import sys
 import os
+from functools import lru_cache
 import pandas as _pd
 import requests
+
+
+@lru_cache(maxsize=1)
+def _a_share_trading_dates() -> frozenset[datetime.date]:
+    import akshare as ak
+
+    df = ak.tool_trade_date_hist_sina()
+    dates = _pd.to_datetime(df["trade_date"], errors="coerce").dt.date
+    return frozenset(d for d in dates if d is not None and not _pd.isna(d))
+
+
+def is_a_share_trading_day(d: datetime.date) -> bool:
+    return d in _a_share_trading_dates()
 
 def telegram_push(message: str):
     bot_token = os.getenv("TG_BOT_TOKEN")
@@ -158,14 +172,30 @@ def main():
 
         net_in_yi = net_sum / 1e8
         turnover_in_yi = turnover_sum / 1e8
-        out_path = args.summary_out if args.summary_out else "fund_flow_summary.csv"
-        combined = save_summary_file(out_path, date_str, net_in_yi, turnover_in_yi)
 
-        print("已保存摘要 CSV（单位：亿）：", out_path)
-        print(combined.to_string(index=False))
+        date_parsed = _parse_dates(_pd.Series([date_str])).iloc[0]
+        if _pd.isna(date_parsed):
+            print(f"日期格式无效（{date_str}），跳过 CSV 写入与推送。")
+            return
 
-        # 默认只推送最新一行
-        latest_row = combined.iloc[[0]]
+        record_date = date_parsed.date()
+        date_iso = record_date.isoformat()
+        latest_row = _pd.DataFrame([{
+            "日期": date_iso,
+            "净流入（亿）": round(net_in_yi, 2),
+            "成交额（亿）": round(turnover_in_yi, 2),
+        }])
+
+        if is_a_share_trading_day(record_date):
+            out_path = args.summary_out if args.summary_out else "fund_flow_summary.csv"
+            combined = save_summary_file(out_path, date_str, net_in_yi, turnover_in_yi)
+            print("已保存摘要 CSV（单位：亿）：", out_path)
+            print(combined.to_string(index=False))
+            latest_row = combined.iloc[[0]]
+        else:
+            print(f"{date_iso} 非 A 股交易日，跳过 CSV 写入。")
+            print(latest_row.to_string(index=False))
+
         md_table = format_markdown_table(latest_row)
         content = f"💹 全市场资金流摘要（{date_str}）\n{md_table}"
         telegram_push(content)
