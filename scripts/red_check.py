@@ -185,10 +185,10 @@ def _fmt_metric(value, digits: int = 2) -> str:
 def format_key_metrics(row, spot_close: float) -> str:
     return (
         "📊 关键指标\n"
-        f"当场股价：{_fmt_metric(spot_close)}\n"
-        f"60 周均线：{_fmt_metric(row['ma60'])}\n"
-        f"120 周均线：{_fmt_metric(row['ma120'])}\n"
-        f"RSI(14周)：{_fmt_metric(row['rsi'])}"
+        f"当场股价：{_fmt_metric(spot_close, 3)}\n"
+        f"60 周均线：{_fmt_metric(row['ma60'], 3)}\n"
+        f"120 周均线：{_fmt_metric(row['ma120'], 3)}\n"
+        f"RSI(14周)：{_fmt_metric(row['rsi'], 3)}"
     )
 
 
