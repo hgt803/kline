@@ -1,5 +1,6 @@
 import os
 import warnings
+from functools import lru_cache
 
 warnings.filterwarnings("ignore", module="urllib3")
 
@@ -33,13 +34,13 @@ def send_telegram(message):
     except Exception as e:
         print(f"发送异常: {e}")
 
-# ------------------ RSI 计算 ------------------
+# ------------------ RSI 计算（Wilder） ------------------
 def compute_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return rsi
@@ -58,6 +59,35 @@ def _sina_symbol(symbol: str) -> str:
     return f"sh{symbol}" if symbol.startswith("5") else f"sz{symbol}"
 
 
+def _market_symbol(symbol: str) -> str:
+    return f"sh{symbol}" if symbol.startswith(("5", "6", "9")) else f"sz{symbol}"
+
+
+def fetch_tencent_weekly_qfq(symbol: str) -> pd.DataFrame:
+    secid = _market_symbol(symbol)
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    params = {"param": f"{secid},week,,,1200,qfq"}
+    resp = requests.get(url, params=params, timeout=10)
+    data = resp.json()
+    rows = (((data.get("data") or {}).get(secid) or {}).get("qfqweek")) or []
+    if not rows:
+        raise ValueError("腾讯 qfq 周线获取失败")
+
+    raw = pd.DataFrame(rows)
+    if raw.shape[1] < 3:
+        raise ValueError("腾讯 qfq 周线字段异常")
+
+    out = pd.DataFrame(
+        {
+            "trade_date": pd.to_datetime(raw.iloc[:, 0], errors="coerce"),
+            "open": pd.to_numeric(raw.iloc[:, 1], errors="coerce"),
+            "close": pd.to_numeric(raw.iloc[:, 2], errors="coerce"),
+        }
+    )
+    out = out.dropna(subset=["trade_date", "open", "close"]).sort_values("trade_date")
+    return out.drop_duplicates("trade_date", keep="last").reset_index(drop=True)
+
+
 def fetch_sina_daily(symbol: str) -> pd.DataFrame:
     df = ak.fund_etf_hist_sina(symbol=_sina_symbol(symbol))
     if df is None or df.empty:
@@ -69,6 +99,73 @@ def daily_to_weekly(daily: pd.DataFrame) -> pd.DataFrame:
     w = daily.set_index("trade_date").sort_index()
     weekly = w.resample("W-FRI").agg({"open": "first", "close": "last"}).dropna(subset=["close"])
     return weekly.reset_index()
+
+
+@lru_cache(maxsize=1)
+def _a_share_trading_dates() -> frozenset:
+    cal = ak.tool_trade_date_hist_sina()
+    dates = pd.to_datetime(cal["trade_date"], errors="coerce").dt.date
+    return frozenset(d for d in dates if d is not None and not pd.isna(d))
+
+
+def _has_future_trading_day_this_week(today: pd.Timestamp) -> bool:
+    if today.weekday() >= 5:
+        return False
+
+    dates = _a_share_trading_dates()
+    end = (today + pd.Timedelta(days=4 - today.weekday())).date()
+    probe = today.date() + pd.Timedelta(days=1)
+
+    while probe <= end:
+        if probe in dates:
+            return True
+        probe = probe + pd.Timedelta(days=1)
+    return False
+
+
+def filter_completed_weeks(df_weekly: pd.DataFrame) -> pd.DataFrame:
+    if df_weekly is None or df_weekly.empty:
+        raise ValueError("周线数据为空")
+
+    out = df_weekly.copy()
+    out["trade_date"] = pd.to_datetime(out["trade_date"])
+    out = out.sort_values("trade_date").reset_index(drop=True)
+
+    today = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).normalize()
+    out = out[out["trade_date"] <= today].copy()
+
+    if not out.empty:
+        last_date = pd.Timestamp(out.iloc[-1]["trade_date"]).normalize()
+        same_week = (
+            last_date.isocalendar().year == today.isocalendar().year
+            and last_date.isocalendar().week == today.isocalendar().week
+        )
+        if same_week and _has_future_trading_day_this_week(today):
+            out = out.iloc[:-1].copy()
+
+    if out.empty:
+        raise ValueError("剔除未收盘周后无可用数据")
+    return out.reset_index(drop=True)
+
+
+def fetch_weekly_with_fallback(symbol: str):
+    try:
+        return fetch_tencent_weekly_qfq(symbol), "腾讯 qfq 周线"
+    except Exception as e:
+        print(f"腾讯周线获取失败，回退新浪日线重采样: {e}")
+        daily = fetch_sina_daily(symbol)
+        return daily_to_weekly(daily), "新浪日线重采样"
+
+
+def fetch_spot_close(symbol: str, fallback_close: float) -> float:
+    try:
+        spot_df = ak.fund_etf_spot_em()
+        row = spot_df[spot_df["代码"].astype(str) == symbol]
+        if not row.empty:
+            return float(row.iloc[0]["最新价"])
+    except Exception as e:
+        print(f"实时价获取失败，使用回退值: {e}")
+    return float(fallback_close)
 
 
 def prepare_weekly_indicators(df_weekly: pd.DataFrame) -> pd.DataFrame:
@@ -100,7 +197,7 @@ def format_push(body: str, row, spot_close: float) -> str:
 
 
 def analyze_signal(df_weekly: pd.DataFrame, spot_close: float):
-    w = prepare_weekly_indicators(df_weekly)
+    w = prepare_weekly_indicators(filter_completed_weeks(df_weekly))
     latest = w.iloc[-1]
 
     # 全仓买入条件
@@ -115,14 +212,32 @@ def analyze_signal(df_weekly: pd.DataFrame, spot_close: float):
     else:
         body = "这周不宜操作"
 
+    latest_date = pd.Timestamp(latest["trade_date"]).strftime("%Y-%m-%d")
+    print(
+        f"已收盘最新周({latest_date}) -> "
+        f"MA60={_fmt_metric(latest['ma60'], 3)}, "
+        f"MA120={_fmt_metric(latest['ma120'], 3)}, "
+        f"RSI14={_fmt_metric(latest['rsi'], 2)}"
+    )
+    if len(w) >= 2:
+        prev = w.iloc[-2]
+        prev_date = pd.Timestamp(prev["trade_date"]).strftime("%Y-%m-%d")
+        print(
+            f"上周({prev_date}) -> "
+            f"MA60={_fmt_metric(prev['ma60'], 3)}, "
+            f"MA120={_fmt_metric(prev['ma120'], 3)}, "
+            f"RSI14={_fmt_metric(prev['rsi'], 2)}"
+        )
+
     send_telegram(format_push(body, latest, spot_close))
 
 # ------------------ 主程序 ------------------
 def main():
     try:
-        daily = fetch_sina_daily(symbol)
-        weekly = daily_to_weekly(daily)
-        spot_close = float(daily.iloc[-1]["close"])
+        weekly, source = fetch_weekly_with_fallback(symbol)
+        completed = filter_completed_weeks(weekly)
+        spot_close = fetch_spot_close(symbol, fallback_close=float(completed.iloc[-1]["close"]))
+        print(f"周线来源: {source}")
         analyze_signal(weekly, spot_close)
     except Exception as e:
         print(f"脚本异常: {e}")
