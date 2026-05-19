@@ -8,10 +8,12 @@ from __future__ import annotations
 import argparse
 import sys
 import os
+import time
 from pathlib import Path
 
 import pandas as pd
 import requests
+from requests import RequestException
 
 RED, GREEN = "#e74c3c", "#2ecc71"
 
@@ -20,6 +22,11 @@ RED, GREEN = "#e74c3c", "#2ecc71"
 # Telegram 推送（图片）
 # =========================
 _TELEGRAM_PHOTO_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def _sanitize_telegram_error(error: Exception, bot_token: str) -> str:
+    """避免 Telegram bot token 出现在日志里。"""
+    return str(error).replace(bot_token, "<TG_BOT_TOKEN>")
 
 
 def resolve_telegram_photo_path(path: Path) -> Path | None:
@@ -56,20 +63,30 @@ def telegram_push_image(image_path: str, caption: str = ""):
 
     mime = "image/jpeg" if photo_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
 
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-        with open(photo_path, "rb") as f:
-            files = {"photo": (photo_path.name, f, mime)}
-            data = {"chat_id": chat_id, "caption": caption[:1024]}
-            r = requests.post(url, data=data, files=files, timeout=20)
+    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    data = {"chat_id": chat_id, "caption": caption[:1024]}
+    max_attempts = 3
 
-        if r.status_code == 200:
-            print("Telegram 推送成功")
-        else:
-            print("Telegram 推送失败：", r.text)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with open(photo_path, "rb") as f:
+                files = {"photo": (photo_path.name, f, mime)}
+                r = requests.post(url, data=data, files=files, timeout=(10, 60))
 
-    except Exception as e:
-        print("Telegram 推送异常：", e)
+            if r.status_code == 200:
+                print("Telegram 推送成功")
+                return
+
+            print(f"Telegram 推送失败（第 {attempt}/{max_attempts} 次）：", r.text)
+            if r.status_code < 500 and r.status_code != 429:
+                return
+
+        except RequestException as e:
+            msg = _sanitize_telegram_error(e, bot_token)
+            print(f"Telegram 推送异常（第 {attempt}/{max_attempts} 次）：", msg)
+
+        if attempt < max_attempts:
+            time.sleep(2 * attempt)
 
 
 # =========================
